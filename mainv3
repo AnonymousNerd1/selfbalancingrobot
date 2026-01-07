@@ -1,0 +1,41 @@
+double setPoint = 0.0;      // target angle (upright)
+double angle;               // measured angle from IMU
+double error;               // current error
+double prevError = 0.0;     // error from previous loop
+
+double integralSum = 0.0;   // "history" for I term
+double dt = 0.01;           // loop time (e.g. 10 ms)
+
+double Kp = 70.0;
+double Ki = 240.0;
+double Kd = 1.9;
+
+void loop() {
+  // 1) Get current angle (from your complementary filter)
+  angle = getFilteredAngle();   // <- your θ
+
+  // 2) Compute error
+  error = setPoint - angle;     // setPoint is usually 0
+
+  // ---------- INTEGRAL (I) PART ----------
+  integralSum += error * dt;    // this is accumulating error over time
+  // (often you clamp this: integralSum = constrain(integralSum, -Imax, Imax);)
+
+  // ---------- DERIVATIVE (D) PART ----------
+  double derivative = (error - prevError) / dt;  // how fast error is changing
+
+  // ---------- PROPORTIONAL (P) PART ----------
+  double P = Kp * error;        // directly from *current* error
+
+  // ---------- BUILD FULL PID OUTPUT ----------
+  double I = Ki * integralSum;  // from accumulated error
+  double D = Kd * derivative;   // from rate of change of error
+
+  double output = P + I + D;    // this goes to your motors
+
+  // 3) Use output to drive motors
+  setMotorOutput(output);
+
+  // 4) Save for next loop (for D term)
+  prevError = error;
+}
