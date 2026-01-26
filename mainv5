@@ -1,0 +1,190 @@
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <math.h>
+
+Adafruit_MPU6050 mpu;
+
+const uint8_t MPU_ADDR = 0x68;
+const uint16_t BAD_STREAK_TO_RESET = 5;
+
+// -------- Motor pins (your setup) --------
+// Motor A
+const int A_PWM = 5;   // D5 (PWM)
+const int A_DIR = 6;   // D6 (direction)
+// Motor B
+const int B_PWM = 9;   // D9 (PWM)
+const int B_DIR = 10;  // D10 (direction)
+
+// Motor power test (start LOW)
+const uint8_t MOTOR_POWER = 80; // 0-255, adjust up if needed
+
+// Tilt trigger thresholds (hysteresis)
+const float TILT_ON_DEG   = 10.0f;
+const float TILT_OFF_DEG  = 7.0f;
+const float TILT_KILL_DEG = 60.0f;  // safety cutoff
+
+static bool motorsEnabled = false;
+
+// -------- Motor control --------
+// Direction convention: DIR=HIGH => forward (swap HIGH/LOW if reversed)
+void motorsOff() {
+  analogWrite(A_PWM, 0);
+  analogWrite(B_PWM, 0);
+}
+
+void motorsForward(uint8_t power) {
+  digitalWrite(A_DIR, HIGH);
+  digitalWrite(B_DIR, HIGH);
+  analogWrite(A_PWM, power);
+  analogWrite(B_PWM, power);
+}
+
+void motorsBackward(uint8_t power) {
+  digitalWrite(A_DIR, LOW);
+  digitalWrite(B_DIR, LOW);
+  analogWrite(A_PWM, power);
+  analogWrite(B_PWM, power);
+}
+
+// -------- MPU init/reset --------
+bool initMPU() {
+  if (!mpu.begin()) return false;
+
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+  return true;
+}
+
+void hardResetMPU() {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x6B);   // PWR_MGMT_1
+  Wire.write(0x80);   // reset
+  Wire.endTransmission(true);
+  delay(100);
+
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x6B);
+  Wire.write(0x00);   // wake
+  Wire.endTransmission(true);
+  delay(10);
+}
+
+// -------- Bad frame detection --------
+bool looksBad(const sensors_event_t &a, const sensors_event_t &g, const sensors_event_t &t) {
+  if (!isfinite(a.acceleration.x) || !isfinite(a.acceleration.y) || !isfinite(a.acceleration.z)) return true;
+  if (!isfinite(g.gyro.x) || !isfinite(g.gyro.y) || !isfinite(g.gyro.z)) return true;
+  if (!isfinite(t.temperature)) return true;
+
+  // all zeros junk frame
+  if (a.acceleration.x == 0.0f && a.acceleration.y == 0.0f && a.acceleration.z == 0.0f &&
+      g.gyro.x == 0.0f && g.gyro.y == 0.0f && g.gyro.z == 0.0f) {
+    return true;
+  }
+
+  float amag = sqrtf(a.acceleration.x*a.acceleration.x +
+                     a.acceleration.y*a.acceleration.y +
+                     a.acceleration.z*a.acceleration.z);
+  if (amag < 0.5f || amag > 50.0f) return true;
+
+  if (t.temperature < -40.0f || t.temperature > 125.0f) return true;
+
+  return false;
+}
+
+// -------- Tilt computation --------
+float radToDeg(float r) { return r * 57.2957795f; }
+
+float computeTiltDegFromZ(const sensors_event_t &a) {
+  float ax = a.acceleration.x, ay = a.acceleration.y, az = a.acceleration.z;
+  float amag = sqrtf(ax*ax + ay*ay + az*az);
+  if (amag < 1.0f) return 999.0f;
+
+  float cosTheta = az / amag;
+  if (cosTheta > 1.0f) cosTheta = 1.0f;
+  if (cosTheta < -1.0f) cosTheta = -1.0f;
+
+  return radToDeg(acosf(cosTheta)); // 0° = upright (Z aligned)
+}
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial) delay(10);
+
+  Wire.begin();
+  Wire.setClock(100000);
+
+  pinMode(A_PWM, OUTPUT);
+  pinMode(A_DIR, OUTPUT);
+  pinMode(B_PWM, OUTPUT);
+  pinMode(B_DIR, OUTPUT);
+
+  motorsOff();
+
+  if (!initMPU()) {
+    Serial.println("Failed to find MPU6050 chip");
+    while (1) delay(10);
+  }
+
+  Serial.println("Ready: tilt past threshold to power motors.");
+}
+
+void loop() {
+  static uint16_t badStreak = 0;
+
+  sensors_event_t a, g, t;
+  mpu.getEvent(&a, &g, &t);
+
+  // ----- Error handling -----
+  if (looksBad(a, g, t)) {
+    badStreak++;
+    motorsOff();
+    motorsEnabled = false;
+
+    Serial.print("BAD frame (streak=");
+    Serial.print(badStreak);
+    Serial.println(") -> motors OFF");
+
+    if (badStreak >= BAD_STREAK_TO_RESET) {
+      Serial.println("Resetting MPU + re-init...");
+      hardResetMPU();
+      if (!initMPU()) Serial.println("Re-init failed (check wiring/power)");
+      badStreak = 0;
+    }
+
+    delay(50);
+    return;
+  }
+  badStreak = 0;
+
+  // ----- Tilt trigger with hysteresis -----
+  float tiltDeg = computeTiltDegFromZ(a);
+
+  // safety cut-off
+  if (tiltDeg > TILT_KILL_DEG) {
+    motorsOff();
+    motorsEnabled = false;
+  } else {
+    if (!motorsEnabled && tiltDeg > TILT_ON_DEG) {
+      motorsEnabled = true;
+      motorsForward(MOTOR_POWER);
+    } else if (motorsEnabled && tiltDeg < TILT_OFF_DEG) {
+      motorsEnabled = false;
+      motorsOff();
+    }
+  }
+
+  Serial.print("TiltDeg=");
+  Serial.print(tiltDeg, 1);
+  Serial.print(" motors=");
+  Serial.print(motorsEnabled ? "ON" : "OFF");
+  Serial.print(" | Accel: ");
+  Serial.print(a.acceleration.x, 2); Serial.print(", ");
+  Serial.print(a.acceleration.y, 2); Serial.print(", ");
+  Serial.print(a.acceleration.z, 2);
+  Serial.print(" | Temp: ");
+  Serial.println(t.temperature, 2);
+
+  delay(20);
+}
