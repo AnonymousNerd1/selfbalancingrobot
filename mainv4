@@ -1,0 +1,120 @@
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <math.h>   // for isnan, isfinite, sqrtf
+
+Adafruit_MPU6050 mpu;
+
+const uint8_t MPU_ADDR = 0x68;  // most common
+const uint16_t BAD_STREAK_TO_RESET = 5;
+
+bool initMPU() {
+  if (!mpu.begin()) return false;
+
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+  return true;
+}
+
+void hardResetMPU() {
+  // PWR_MGMT_1 reset + wake (works even if library state is confused)
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x6B);   // PWR_MGMT_1
+  Wire.write(0x80);   // DEVICE_RESET bit
+  Wire.endTransmission(true);
+  delay(100);
+
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x6B);
+  Wire.write(0x00);   // wake
+  Wire.endTransmission(true);
+  delay(10);
+}
+
+bool looksBad(const sensors_event_t &a, const sensors_event_t &g, const sensors_event_t &t) {
+  // 1) NaN/Inf check (definitely broken)
+  if (!isfinite(a.acceleration.x) || !isfinite(a.acceleration.y) || !isfinite(a.acceleration.z)) return true;
+  if (!isfinite(g.gyro.x) || !isfinite(g.gyro.y) || !isfinite(g.gyro.z)) return true;
+  if (!isfinite(t.temperature)) return true;
+
+  // 2) “All zeros” check (classic bad I2C frame)
+  if (a.acceleration.x == 0.0f && a.acceleration.y == 0.0f && a.acceleration.z == 0.0f &&
+      g.gyro.x == 0.0f && g.gyro.y == 0.0f && g.gyro.z == 0.0f) {
+    return true;
+  }
+
+  // 3) Optional sanity: accel magnitude should be “somewhere near” 1g when sitting still.
+  // Keep it loose so it doesn't false-trigger while moving.
+  float amag = sqrtf(a.acceleration.x*a.acceleration.x +
+                     a.acceleration.y*a.acceleration.y +
+                     a.acceleration.z*a.acceleration.z);
+  if (amag < 0.5f || amag > 50.0f) return true; // absurd values
+
+  // 4) Temp sanity: MPU temp is chip temp, but if it suddenly snaps to exactly ~36.53 often,
+  // that suggests raw temp==0 type junk. Allow a wide range but catch obvious nonsense.
+  if (t.temperature < -40.0f || t.temperature > 125.0f) return true;
+
+  return false;
+}
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial) delay(10);
+
+  Serial.println("MPU6050 test!");
+  Wire.begin();
+  Wire.setClock(100000); // more stable
+
+  if (!initMPU()) {
+    Serial.println("Failed to find MPU6050 chip");
+    while (1) delay(10);
+  }
+
+  Serial.println("MPU6050 ready.");
+}
+
+void loop() {
+  static uint16_t badStreak = 0;
+
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+
+  if (looksBad(a, g, temp)) {
+    badStreak++;
+    Serial.print("BAD frame (streak=");
+    Serial.print(badStreak);
+    Serial.println(") - skipping");
+
+    if (badStreak >= BAD_STREAK_TO_RESET) {
+      Serial.println("Resetting MPU + re-init...");
+      hardResetMPU();
+
+      // Re-init the Adafruit driver settings after reset
+      if (!initMPU()) {
+        Serial.println("Re-init failed (check wiring/power)");
+      }
+      badStreak = 0;
+    }
+
+    delay(50);
+    return; // don't print junk
+  }
+
+  badStreak = 0;
+
+  Serial.print("Accel (m/s^2): ");
+  Serial.print(a.acceleration.x); Serial.print(", ");
+  Serial.print(a.acceleration.y); Serial.print(", ");
+  Serial.print(a.acceleration.z);
+
+  Serial.print(" | Gyro (rad/s): ");
+  Serial.print(g.gyro.x); Serial.print(", ");
+  Serial.print(g.gyro.y); Serial.print(", ");
+  Serial.print(g.gyro.z);
+
+  Serial.print(" | Temp (C): ");
+  Serial.println(temp.temperature);
+
+  delay(200);
+}
